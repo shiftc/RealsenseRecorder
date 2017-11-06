@@ -10,15 +10,12 @@
 #include <opencv2\opencv.hpp>
 
 // Define to write CSV File
-#include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 
 RSRecorder::~RSRecorder() {
-  if (_sense_manager != NULL) {
-    _sense_manager->Release();
-  }
+  if (_sense_manager != NULL) _sense_manager->Release();
 }
 RSRecorder::RSRecorder()
     : _sense_manager(NULL),
@@ -29,9 +26,12 @@ RSRecorder::RSRecorder()
       _frame_timestamp(0),
       _frame_id(0) {
   _sense_manager = PXCSenseManager::CreateInstance();
+  _expression_map_init();
 }
 
 void RSRecorder::fini() {
+  if (_face_data != NULL) _face_data->Release();
+  if (_sense_manager != NULL) _sense_manager->Close();
   if (_ofs_pose.is_open()) _ofs_pose.close();
   if (_ofs_landmark.is_open()) _ofs_landmark.close();
   if (_video_writer.isOpened()) _video_writer.release();
@@ -45,6 +45,9 @@ void RSRecorder::init(bool show_pose, bool show_eyest, bool show_ldmk) {
   if (_sense_manager == NULL) {
     throw std::runtime_error("_sense_manager create fail");
   }
+  PXCSession *session = _sense_manager->QuerySession();
+  PXCSession::CoordinateSystem cs = session->QueryCoordinateSystem();
+  std::cout << "COORDINATE SYSTEM " << cs << std::endl;
 
   std::time_t now_t = time(NULL);
   struct tm localt;
@@ -76,11 +79,6 @@ void RSRecorder::init(bool show_pose, bool show_eyest, bool show_ldmk) {
     _ofs_landmark << "," << s << "._image_x," << s << "._image_y";
   }
 
-  for (int s = 0; s < 78; s++) {
-    _ofs_landmark << "," << s << "._world_x," << s << "._world_y," << s
-                  << "._world_z";
-  }
-
   _ofs_landmark << std::endl;
 
 #pragma endregion LandmarkCSVFileInit
@@ -93,16 +91,13 @@ void RSRecorder::init(bool show_pose, bool show_eyest, bool show_ldmk) {
     throw std::runtime_error("ofs expression open fail");
 
   _ofs_expression << "timestamp,frame,"
+                  << "Rect.x,Rect.y,Rect.w,Rect.h";
+  for (auto expression_iter = _expression_map.begin();
+       expression_iter != _expression_map.end(); expression_iter++) {
+    _ofs_expression << "," << expression_iter->second.first;
+  }
 
-                  << "Rect.x,Rect.y,Rect.w,Rect.h,"
-                  << "BROW_RAISER_LEFT, BROW_RAISER_RIGHT, BROW_LOWERER_LEFT, "
-                     "BROW_LOWERER_RIGHT,"
-                  << "SMILE, KISS, MOUTH_OPEN, TONGUE_OUT,"
-                  << "HEAD_TURN_LEFT, HEAD_TURN_RIGHT, HEAD_UP, HEAD_DOWN, "
-                     "HEAD_TILT_LEFT,"
-                  << "EYES_CLOSED_LEFT, EYES_CLOSED_RIGHT, EYES_TURN_LEFT, "
-                     "EYES_TURN_RIGHT, EYES_UP, EYES_DOWN,"
-                  << "PUFF_LEFT,PUFF_RIGHT," << std::endl;
+  _ofs_expression << std::endl;
 
 #pragma endregion ExpressionCSVFileInit
 
@@ -112,10 +107,10 @@ void RSRecorder::init(bool show_pose, bool show_eyest, bool show_ldmk) {
   if (!_ofs_pose.is_open()) throw std::runtime_error("ofs pose open fail");
 
   _ofs_pose << "timestamp,frame,"
+            << "Rect.x,Rect.y,Rect.w,Rect.h,"
             << "yaw,"
             << "pitch,"
-            << "roll,"
-            << "Rect.x,Rect.y,Rect.w,Rect.h," << std::endl;
+            << "roll" << std::endl;
 #pragma endregion PoseCSVFileInit
 
   pxcStatus sts =
@@ -188,6 +183,7 @@ void RSRecorder::_face_track_init() {
   config->QueryExpressions()->Enable();
   config->QueryExpressions()->EnableAllExpressions();
   config->QueryExpressions()->properties.maxTrackedFaces = 2;
+
   config->ApplyChanges();
 
   _face_data = faceModule->CreateOutput();
@@ -220,16 +216,16 @@ void RSRecorder::_update_frame() {
 void RSRecorder::_update_face() {
   const PXCCapture::Sample *sample = _sense_manager->QuerySample();
   if (sample) {
-    update_origin_mat(sample->color);
+    _update_mat(sample->color);
     _frame_timestamp = sample->color->QueryTimeStamp();
   }
 
   _face_data->Update();
 
   int numFaces = _face_data->QueryNumberOfDetectedFaces();
-  if (numFaces > 1) {
+  if (numFaces > _MAXFACES) {
     std::cout << "face num " << numFaces << std::endl;
-    numFaces = 1;
+    numFaces = _MAXFACES;
   }
 
   for (int i = 0; i < numFaces; ++i) {
@@ -238,11 +234,7 @@ void RSRecorder::_update_face() {
       continue;
     }
 
-#pragma region GetFacePose
-
     PXCRectI32 faceRect = {0};
-    PXCFaceData::PoseEulerAngles poseAngle[_MAXFACES] = {0};
-
     auto detection = face->QueryDetection();
     if (detection != 0) {
       detection->QueryBoundingRect(&faceRect);
@@ -251,19 +243,21 @@ void RSRecorder::_update_face() {
     cv::rectangle(_show_mat,
                   cv::Rect(faceRect.x, faceRect.y, faceRect.w, faceRect.h),
                   cv::Scalar(255, 0, 0));
+#pragma region GetFacePose
 
+    PXCFaceData::PoseEulerAngles poseAngle[_MAXFACES] = {0};
     PXCFaceData::PoseData *pose = face->QueryPose();
     if (pose != NULL) {
       pxcBool sts = pose->QueryPoseAngles(&poseAngle[i]);
       if (sts < PXC_STATUS_NO_ERROR) {
         throw std::runtime_error("QueryPoseAngles failed");
       }
+      // Writing to CSV files about face pose info
       _ofs_pose << _frame_timestamp << ","  //timestamp
-                << _frame_id << ","         // frame
-                << poseAngle[i].yaw << ","  //Angle
-                << poseAngle[i].pitch << "," << poseAngle[i].roll << faceRect.x
-                << "," << faceRect.y << "," << faceRect.w << "," << faceRect.h
-                << std::endl;
+                << _frame_id << ","         //frame
+                << faceRect.x << "," << faceRect.y << "," << faceRect.w << ","
+                << faceRect.h << "," << poseAngle[i].yaw << ","  //Angle
+                << poseAngle[i].pitch << "," << poseAngle[i].roll << std::endl;
       if (_show_pose) {
         {
           std::stringstream ss;
@@ -316,13 +310,17 @@ void RSRecorder::_update_face() {
             ss << j;
 
             if (/*landmarkPoints[j].source.alias != 0 &&*/ _show_ldmk) {
-              if (landmarkPoints[j].confidenceImage > 50)
+              if (landmarkPoints[j].confidenceImage > 50) {
+                cv::circle(_show_mat,
+                           cv::Point(landmarkPoints[j].image.x,
+                                     landmarkPoints[j].image.y),
+                           1, cv::Scalar(0, 255, 0), 1);
                 cv::putText(_show_mat, ss.str(),
                             cv::Point(landmarkPoints[j].image.x,
                                       landmarkPoints[j].image.y),
                             cv::FONT_HERSHEY_SIMPLEX, 0.2,
                             cv::Scalar(255, 255, 255), 1, CV_AA);
-              else
+              } else
                 cv::putText(_show_mat, ss.str(),
                             cv::Point(landmarkPoints[j].image.x,
                                       landmarkPoints[j].image.y),
@@ -333,34 +331,10 @@ void RSRecorder::_update_face() {
           // Writing to CSV files about Landmark info
           _ofs_landmark << "," << landmarkPoints[j].image.x << ","
                         << landmarkPoints[j].image.y;
-
-#if 0
-          for(int s = 0; s < numPoints; s++) {
-            pxcF32 land_x, land_y, land_z;
-
-            if(fabsf(landmarkPoints[s].world.x) > 1)
-              land_x = FloatRound(landmarkPoints[s].world.x, 4) * (-1) / 1000;
-            else
-              land_x = FloatRound(landmarkPoints[s].world.x, 4);
-
-            if(fabsf(landmarkPoints[s].world.y) > 1)
-              land_y = FloatRound(landmarkPoints[s].world.y, 4) / 1000;
-            else
-              land_y = FloatRound(landmarkPoints[s].world.y, 4);
-
-            if(fabsf(landmarkPoints[s].world.z) > 2)
-              land_z = FloatRound(landmarkPoints[s].world.z, 4) / 1000;
-            else
-              land_z = FloatRound(landmarkPoints[s].world.z, 4);
-
-            _ofs_landmark << "," << FloatRound(land_x, 4) << ","
-              << FloatRound(land_y, 4) << "," << FloatRound(land_z, 4);
-          }
-#endif
         }
         _ofs_landmark << std::endl;
-        delete[] landmarkPoints;
       }
+      if (landmarkPoints) delete[] landmarkPoints;
     }
 
 #pragma endregion GetFaceLandmarks
@@ -369,138 +343,58 @@ void RSRecorder::_update_face() {
 
     PXCFaceData::ExpressionsData *expressionData;
     PXCFaceData::ExpressionsData::FaceExpressionResult expressionResult;
-    int expressionResult2[21];
-
-    PXCFaceData::ExpressionsData::FaceExpression expressionLabel[21] = {
-        PXCFaceData::ExpressionsData::EXPRESSION_BROW_RAISER_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_BROW_RAISER_RIGHT,
-        PXCFaceData::ExpressionsData::EXPRESSION_BROW_LOWERER_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_BROW_LOWERER_RIGHT,
-        PXCFaceData::ExpressionsData::EXPRESSION_SMILE,
-        PXCFaceData::ExpressionsData::EXPRESSION_KISS,
-        PXCFaceData::ExpressionsData::EXPRESSION_MOUTH_OPEN,
-        PXCFaceData::ExpressionsData::EXPRESSION_TONGUE_OUT,
-        PXCFaceData::ExpressionsData::EXPRESSION_HEAD_TURN_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_HEAD_TURN_RIGHT,
-        PXCFaceData::ExpressionsData::EXPRESSION_HEAD_UP,
-        PXCFaceData::ExpressionsData::EXPRESSION_HEAD_DOWN,
-        PXCFaceData::ExpressionsData::EXPRESSION_HEAD_TILT_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_RIGHT,
-        PXCFaceData::ExpressionsData::EXPRESSION_EYES_TURN_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_EYES_TURN_RIGHT,
-        PXCFaceData::ExpressionsData::EXPRESSION_EYES_UP,
-        PXCFaceData::ExpressionsData::EXPRESSION_EYES_DOWN,
-        PXCFaceData::ExpressionsData::EXPRESSION_PUFF_LEFT,
-        PXCFaceData::ExpressionsData::EXPRESSION_PUFF_RIGHT};
-
+    int eye_closed_left = -1;
+    int eye_closed_right = -1;
     expressionData = face->QueryExpressions();
     if (expressionData != NULL) {
-      for (int jj = 0; jj < 21; jj++) {
-        expressionResult2[jj] = 0;
-        if (expressionData->QueryExpression(expressionLabel[jj],
-                                            &expressionResult)) {
-          {
-            expressionResult2[jj] = expressionResult.intensity;
-          }
-        }
-      }
-
-      if (_show_eyest) {
-        int eye_turn_left = -1;
-        int eye_turn_right = -1;
-        int eye_up = -1;
-        int eye_down = -1;
-        int eye_closed_left = -1;
-        int eye_closed_right = -1;
-
-        if (expressionData->QueryExpression(
-                PXCFaceData::ExpressionsData::EXPRESSION_EYES_TURN_LEFT,
-                &expressionResult)) {
-          eye_turn_left = expressionResult.intensity;
-        }
-        if (expressionData->QueryExpression(
-                PXCFaceData::ExpressionsData::EXPRESSION_EYES_TURN_RIGHT,
-                &expressionResult)) {
-          eye_turn_right = expressionResult.intensity;
-        }
-        if (expressionData->QueryExpression(
-                PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_LEFT,
-                &expressionResult)) {
-          eye_closed_left = expressionResult.intensity;
-        }
-        if (expressionData->QueryExpression(
-                PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_RIGHT,
-                &expressionResult)) {
-          eye_closed_right = expressionResult.intensity;
-        }
-        if (expressionData->QueryExpression(
-                PXCFaceData::ExpressionsData::EXPRESSION_EYES_UP,
-                &expressionResult)) {
-          eye_up = expressionResult.intensity;
-        }
-        if (expressionData->QueryExpression(
-                PXCFaceData::ExpressionsData::EXPRESSION_EYES_DOWN,
-                &expressionResult)) {
-          eye_down = expressionResult.intensity;
-        }
-
-        int eyeX;
-        int eyeY;
-
-        if (eye_turn_left == eye_turn_right == -1) {
-          eyeX = -9999;
-        } else if (eye_turn_left == eye_turn_right) {
-          eyeX = eye_turn_left;
-        } else if (eye_turn_left < eye_turn_right) {
-          eyeX = eye_turn_right;
-        } else {
-          eyeX = -eye_turn_left;
-        }
-
-        if (eye_up == eye_down == -1) {
-          eyeY = -9999;
-        } else if (eye_up == eye_down) {
-          eyeY = eye_up;
-        } else if (eye_up > eye_down) {
-          eyeY = eye_up;
-        } else {
-          eyeY = -eye_down;
-        }
-
-        std::stringstream ss1;
-        ss1 << "EYE_LOCATION: " << eyeX << ", " << eyeY;
-        cv::putText(_show_mat, ss1.str(),
-                    cv::Point(faceRect.x, faceRect.y + faceRect.h + 10),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2,
-                    CV_AA);
-
-        std::stringstream ss2;
-        ss2 << "EYE_CLOSED: " << eye_closed_left << ", " << eye_closed_right;
-        cv::putText(_show_mat, ss2.str(),
-                    cv::Point(faceRect.x, faceRect.y + faceRect.h + 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2,
-                    CV_AA);
-      }
-
       // Writing to CSV files about Landmark info
       _ofs_expression << _frame_timestamp << ","  //timestamp
                       << _frame_id << ","         //frame
                       << faceRect.x << "," << faceRect.y << "," << faceRect.w
-                      << "," << faceRect.h << ",";
+                      << "," << faceRect.h;
 
-      for (int jj = 0; jj < 21; jj++) {
-        _ofs_expression << expressionResult2[jj];
-        if (jj < 20) {
-          _ofs_expression << ",";
+      for (auto expression_iter = _expression_map.begin();
+           expression_iter != _expression_map.end(); expression_iter++) {
+        if (expressionData->QueryExpression(expression_iter->first,
+                                            &expressionResult)) {
+          expression_iter->second.second = expressionResult.intensity;
         }
+        _ofs_expression << "," << expression_iter->second.second;
       }
 
       _ofs_expression << std::endl;
+      if (_show_eyest) {
+        {
+          std::stringstream ss;
+          ss << _expression_map
+                    [PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_LEFT]
+                        .first
+             << ": "
+             << _expression_map
+                    [PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_LEFT]
+                        .second;
+          cv::putText(_show_mat, ss.str(),
+                      cv::Point(faceRect.x, faceRect.y + faceRect.h + 20),
+                      cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255),
+                      1, CV_AA);
+        }
+        {
+          std::stringstream ss;
+          ss << _expression_map
+                    [PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_RIGHT]
+                        .first
+             << ": "
+             << _expression_map
+                    [PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_RIGHT]
+                        .second;
+          cv::putText(_show_mat, ss.str(),
+                      cv::Point(faceRect.x, faceRect.y + faceRect.h + 45),
+                      cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255),
+                      1, CV_AA);
+        }
+      }
     }
 #pragma endregion GetFaceExpression
-
-#pragma region WriteCSVFiles
 
     {
       std::stringstream ss;
@@ -509,27 +403,11 @@ void RSRecorder::_update_face() {
                   cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2,
                   CV_AA);
     }
-
-#pragma endregion WriteCSVFiles
   }
 }
 
-pxcF32 RSRecorder::FloatRound(pxcF32 f, int roundNum) {
-  pxcF32 ret = 0;
-  int _r;
-  if (f == 0) {
-    return 0;
-  } else {
-    _r = (int)(f * (pow(10, roundNum)));
-
-    ret = _r / pow(10, roundNum);
-
-    return ret;
-  }
-}
-
-void RSRecorder::update_origin_mat(PXCImage *colorFrame) {
-  if (colorFrame == 0) {
+void RSRecorder::_update_mat(PXCImage *colorFrame) {
+  if (colorFrame == NULL) {
     return;
   }
 
@@ -551,7 +429,7 @@ void RSRecorder::update_origin_mat(PXCImage *colorFrame) {
 
 bool RSRecorder::_show_record_image() {
   cv::imshow("show", _show_mat);
-  //_video_writer.write(_origin_mat);
+  _video_writer.write(_origin_mat);
 
   int c = cv::waitKey(1);
   if ((c == 27) || (c == 'q') || (c == 'Q')) {
@@ -560,6 +438,41 @@ bool RSRecorder::_show_record_image() {
   }
 
   return true;
+}
+
+void RSRecorder::_expression_map_init() {
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_SMILE] =
+      std::make_pair("Smile", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_MOUTH_OPEN] =
+      std::make_pair("Mouth Open", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_KISS] =
+      std::make_pair("Kiss", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_EYES_TURN_LEFT] =
+      std::make_pair("Eyes Turn Left", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_EYES_TURN_RIGHT] =
+      std::make_pair("Eyes Turn Right", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_EYES_UP] =
+      std::make_pair("Eyes Up", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_EYES_DOWN] =
+      std::make_pair("Eyes Down", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_BROW_RAISER_LEFT] =
+      std::make_pair("Brow Raised Left", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_BROW_RAISER_RIGHT] =
+      std::make_pair("Brow Raised Right", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_BROW_LOWERER_LEFT] =
+      std::make_pair("Brow Lowered Left", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_BROW_LOWERER_RIGHT] =
+      std::make_pair("Brow Lowered Right", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_LEFT] =
+      std::make_pair("Closed Eye Left", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_EYES_CLOSED_RIGHT] =
+      std::make_pair("Closed Eye Right", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_TONGUE_OUT] =
+      std::make_pair("Tongue Out", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_PUFF_RIGHT] =
+      std::make_pair("Puff Right Cheek", -1);
+  _expression_map[PXCFaceData::ExpressionsData::EXPRESSION_PUFF_LEFT] =
+      std::make_pair("Puff Left Cheek", -1);
 }
 
 void RSRecorder::showFps() {

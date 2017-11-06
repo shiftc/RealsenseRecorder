@@ -6,29 +6,31 @@
 #include <opencv2\opencv.hpp>
 #include <string>
 class RSRecorder {
-public:
+ public:
   ~RSRecorder();
   RSRecorder();
 
   void fini();
-  void init(bool show_pose = true, bool show_eyest = false, bool show_ldmk = false);
+  void init(bool show_pose = true, bool show_eyest = false,
+            bool show_ldmk = false);
   void run();
 
-private:
+ private:
   void _face_track_init();
+
+  void _expression_map_init();
+
   void _update_frame();
 
   void _update_face();
 
-  pxcF32 FloatRound(pxcF32 f, int roundNum);
-
-  void update_origin_mat(PXCImage *colorFrame);
+  void _update_mat(PXCImage *colorFrame);
 
   bool _show_record_image();
 
   void showFps();
 
-private:
+ private:
   // cv::Mat _origin_mat;
   cv::Mat _origin_mat;
   cv::Mat _show_mat;
@@ -38,7 +40,9 @@ private:
   std::ofstream _ofs_landmark;
   std::ofstream _ofs_expression;
   std::ofstream _ofs_pose;
-
+  std::map<PXCFaceData::ExpressionsData::FaceExpression,
+           std::pair<std::string, int> >
+      _expression_map;
 
   bool _show_pose;
   bool _show_eyest;
@@ -52,8 +56,5 @@ private:
   pxcI64 _frame_timestamp;
   int64 _frame_id;
 
-
   errno_t err;
-
-
 };
